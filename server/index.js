@@ -8,8 +8,20 @@ import { Resend } from "resend";
 
 const app = express();
 
-const HTTP_PORT = Number(process.env.PORT || 4000);
-const SMTP_PORT = Number(process.env.SMTP_PORT || 2525);
+function envValue(name, fallback = "") {
+  const value = process.env[name];
+
+  if (value === undefined || value === null) {
+    return fallback;
+  }
+
+  const trimmed = String(value).trim();
+
+  return trimmed || fallback;
+}
+
+const HTTP_PORT = Number(envValue("PORT", "4000"));
+const SMTP_PORT = Number(envValue("SMTP_PORT", "2525"));
 
 /*
 =====================================================
@@ -18,7 +30,7 @@ CONFIGURATION
 */
 
 const MAIL_DOMAIN =
-  process.env.MAIL_DOMAIN || "temp.local";
+  envValue("MAIL_DOMAIN", "temp.local");
 
 const TTL_MINUTES = 15;
 
@@ -26,16 +38,16 @@ const MAX_MESSAGE_BYTES =
   5 * 1024 * 1024;
 
 const RESEND_API_KEY =
-  process.env.RESEND_API_KEY || "";
+  envValue("RESEND_API_KEY");
 
 const RESEND_WEBHOOK_SECRET =
-  process.env.RESEND_WEBHOOK_SECRET || "";
+  envValue("RESEND_WEBHOOK_SECRET");
 
 const SUPABASE_URL =
-  process.env.SUPABASE_URL;
+  envValue("SUPABASE_URL");
 
 const SUPABASE_SECRET_KEY =
-  process.env.SUPABASE_SECRET_KEY;
+  envValue("SUPABASE_SECRET_KEY");
 
 if (!SUPABASE_URL) {
   console.error(
@@ -134,6 +146,30 @@ function extractEmailAddress(value) {
   }
 
   return normalizeEmail(text);
+}
+
+function collectEmailAddresses(value) {
+  if (!value) {
+    return [];
+  }
+
+  if (Array.isArray(value)) {
+    return value.flatMap(collectEmailAddresses);
+  }
+
+  if (typeof value === "object") {
+    return collectEmailAddresses(
+      value.email ||
+        value.address ||
+        value.mail ||
+        value.value ||
+        ""
+    );
+  }
+
+  const address = extractEmailAddress(value);
+
+  return address ? [address] : [];
 }
 
 function safeErrorMessage(error) {
@@ -413,6 +449,213 @@ async function getSingleMessage(
             )
         })
       )
+  };
+}
+
+async function storeResendReceivedEmail(
+  emailId,
+  eventData = {}
+) {
+  if (!resend) {
+    throw new Error(
+      "Resend is not configured"
+    );
+  }
+
+  if (!emailId) {
+    throw new Error(
+      "Resend email ID is missing"
+    );
+  }
+
+  const {
+    data: receivedEmail,
+    error: receivedEmailError
+  } =
+    await resend.emails.receiving.get(
+      emailId
+    );
+
+  if (receivedEmailError) {
+    throw receivedEmailError;
+  }
+
+  if (!receivedEmail) {
+    throw new Error(
+      "Received email data is empty"
+    );
+  }
+
+  const normalizedRecipients =
+    [
+      ...new Set([
+        ...collectEmailAddresses(
+          eventData?.to
+        ),
+        ...collectEmailAddresses(
+          receivedEmail?.to
+        ),
+        ...collectEmailAddresses(
+          receivedEmail?.received_for
+        )
+      ])
+    ].filter(Boolean);
+
+  let inbox = null;
+
+  for (const recipient of normalizedRecipients) {
+    const possibleInbox =
+      await getInboxByAddress(recipient);
+
+    if (possibleInbox) {
+      inbox = possibleInbox;
+      break;
+    }
+  }
+
+  if (!inbox) {
+    return {
+      stored: false,
+      reason:
+        "Temporary inbox not found",
+      recipients:
+        normalizedRecipients
+    };
+  }
+
+  const expiresAt =
+    new Date(
+      inbox.expires_at
+    ).getTime();
+
+  if (expiresAt <= Date.now()) {
+    return {
+      stored: false,
+      reason:
+        "Temporary inbox expired",
+      inbox:
+        inbox.address
+    };
+  }
+
+  if (isUuid(emailId)) {
+    const existingMessage =
+      await getSingleMessage(
+        inbox.id,
+        emailId
+      );
+
+    if (existingMessage) {
+      return {
+        stored: true,
+        duplicate: true,
+        messageId:
+          emailId,
+        inbox:
+          inbox.address
+      };
+    }
+  }
+
+  const messageId =
+    isUuid(emailId)
+      ? emailId
+      : crypto.randomUUID();
+
+  const sender =
+    extractEmailAddress(
+      receivedEmail.from ||
+        eventData?.from ||
+        "unknown@unknown"
+    ) ||
+    "unknown@unknown";
+
+  const recipient =
+    normalizedRecipients.find(
+      (address) =>
+        address ===
+        normalizeEmail(inbox.address)
+    ) ||
+    inbox.address;
+
+  const subject =
+    receivedEmail.subject ||
+    eventData?.subject ||
+    "(No subject)";
+
+  const body =
+    typeof receivedEmail.text ===
+    "string"
+      ? receivedEmail.text
+      : "";
+
+  const html =
+    typeof receivedEmail.html ===
+    "string"
+      ? receivedEmail.html
+      : null;
+
+  const receivedAt =
+    receivedEmail.created_at ||
+    eventData?.created_at ||
+    new Date().toISOString();
+
+  const {
+    error: messageError
+  } =
+    await supabase
+      .from("messages")
+      .insert({
+        id:
+          messageId,
+
+        inbox_id:
+          inbox.id,
+
+        from_email:
+          sender,
+
+        to_email:
+          recipient,
+
+        subject,
+
+        body,
+
+        html,
+
+        received_at:
+          receivedAt,
+
+        is_read:
+          false
+      });
+
+  if (messageError) {
+    if (messageError.code === "23505") {
+      return {
+        stored: true,
+        duplicate: true,
+        messageId,
+        inbox:
+          inbox.address
+      };
+    }
+
+    throw messageError;
+  }
+
+  return {
+    stored: true,
+    duplicate: false,
+    messageId,
+    inbox:
+      inbox.address,
+    from:
+      sender,
+    to:
+      recipient,
+    subject
   };
 }
 
@@ -2483,6 +2726,96 @@ setInterval(
     );
   },
   30 * 1000
+);
+
+/*
+=====================================================
+RESEND INBOUND POLLING FALLBACK
+=====================================================
+
+Webhooks are still the primary receive path. This
+polling fallback imports recent Resend inbound emails
+if a webhook is delayed, misconfigured, or missed.
+*/
+
+async function syncRecentResendEmails() {
+  if (!resend) {
+    return;
+  }
+
+  try {
+    const { data, error } =
+      await resend.emails.receiving.list({
+        limit: 20
+      });
+
+    if (error) {
+      console.error(
+        "[RESEND] Polling list error:",
+        error
+      );
+
+      return;
+    }
+
+    const receivedEmails =
+      Array.isArray(data?.data)
+        ? data.data
+        : Array.isArray(data)
+        ? data
+        : [];
+
+    for (const email of receivedEmails) {
+      const emailId =
+        email?.id ||
+        email?.email_id;
+
+      if (!emailId) {
+        continue;
+      }
+
+      try {
+        const result =
+          await storeResendReceivedEmail(
+            emailId,
+            email
+          );
+
+        if (
+          result.stored &&
+          !result.duplicate
+        ) {
+          console.log(
+            `[RESEND] Polled email stored: ${result.from} -> ${result.to}`
+          );
+        }
+      } catch (error) {
+        console.error(
+          `[RESEND] Polling import failed for ${emailId}:`,
+          safeErrorMessage(error)
+        );
+      }
+    }
+  } catch (error) {
+    console.error(
+      "[RESEND] Polling sync error:",
+      safeErrorMessage(error)
+    );
+  }
+}
+
+setInterval(
+  () => {
+    syncRecentResendEmails().catch(
+      (error) => {
+        console.error(
+          "[RESEND] Scheduled polling error:",
+          safeErrorMessage(error)
+        );
+      }
+    );
+  },
+  60 * 1000
 );
 
 /*
