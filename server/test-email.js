@@ -5,7 +5,7 @@ const PORT = 2525;
 
 // IMPORTANT:
 // Use the CURRENT address shown on your website.
-const TO = "bac1028c9f1c@temp.local";
+const TO = "99c8f2d819d6@temp.local";
 
 const FROM = "test@example.com";
 

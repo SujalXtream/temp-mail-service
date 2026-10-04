@@ -4,13 +4,15 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node --watch index.js",
-    "start": "node index.js"
+    "dev": "node --env-file=.env --watch index.js",
+    "start": "node --env-file=.env index.js"
   },
   "dependencies": {
+    "@supabase/supabase-js": "^2.117.2",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "mailparser": "^3.9.33",
+    "resend": "^6.32.0",
     "smtp-server": "^3.19.16"
   }
 }
