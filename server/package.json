@@ -1,0 +1,16 @@
+{
+  "name": "temp-mail-server",
+  "version": "2.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch index.js",
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.21.2",
+    "mailparser": "^3.9.33",
+    "smtp-server": "^3.19.16"
+  }
+}
