@@ -452,6 +452,161 @@ async function getSingleMessage(
   };
 }
 
+async function storeResendAttachments(
+  emailId,
+  messageId
+) {
+  let attachmentCount = 0;
+
+  try {
+    const {
+      data: attachmentList,
+      error: attachmentListError
+    } =
+      await resend
+        .emails
+        .receiving
+        .attachments
+        .list({
+          emailId
+        });
+
+    if (attachmentListError) {
+      console.error(
+        "[RESEND] Attachment list error:",
+        attachmentListError
+      );
+
+      return attachmentCount;
+    }
+
+    const attachments =
+      Array.isArray(
+        attachmentList?.data
+      )
+        ? attachmentList.data
+        : [];
+
+    if (attachments.length === 0) {
+      return attachmentCount;
+    }
+
+    const attachmentRows = [];
+    let totalAttachmentBytes = 0;
+
+    for (const attachment of attachments) {
+      const size =
+        Number(
+          attachment.size || 0
+        );
+
+      if (
+        totalAttachmentBytes + size >
+        MAX_MESSAGE_BYTES
+      ) {
+        console.warn(
+          `[RESEND] Skipping attachment because total size exceeds ${MAX_MESSAGE_BYTES} bytes.`
+        );
+
+        continue;
+      }
+
+      let contentBase64 = null;
+
+      if (attachment.download_url) {
+        try {
+          const response =
+            await fetch(
+              attachment.download_url
+            );
+
+          if (response.ok) {
+            const buffer =
+              Buffer.from(
+                await response.arrayBuffer()
+              );
+
+            if (
+              buffer.length <=
+              MAX_MESSAGE_BYTES
+            ) {
+              contentBase64 =
+                buffer.toString(
+                  "base64"
+                );
+
+              totalAttachmentBytes +=
+                buffer.length;
+            }
+          } else {
+            console.error(
+              `[RESEND] Attachment download failed: ${response.status}`
+            );
+          }
+        } catch (
+          attachmentDownloadError
+        ) {
+          console.error(
+            "[RESEND] Attachment download error:",
+            attachmentDownloadError
+          );
+        }
+      }
+
+      attachmentRows.push({
+        id:
+          crypto.randomUUID(),
+
+        message_id:
+          messageId,
+
+        filename:
+          attachment.filename ||
+          "attachment",
+
+        content_type:
+          attachment.content_type ||
+          "application/octet-stream",
+
+        size,
+
+        content_base64:
+          contentBase64
+      });
+    }
+
+    if (attachmentRows.length === 0) {
+      return attachmentCount;
+    }
+
+    const {
+      error: attachmentInsertError
+    } =
+      await supabase
+        .from("attachments")
+        .insert(attachmentRows);
+
+    if (attachmentInsertError) {
+      throw attachmentInsertError;
+    }
+
+    attachmentCount =
+      attachmentRows.length;
+  } catch (attachmentError) {
+    /*
+    If attachment processing fails, keep the email
+    itself. The user should still be able to read it.
+    */
+
+    console.error(
+      "[RESEND] Attachment processing error:",
+      attachmentError
+    );
+  }
+
+  return attachmentCount;
+}
+
 async function storeResendReceivedEmail(
   emailId,
   eventData = {}
@@ -551,6 +706,8 @@ async function storeResendReceivedEmail(
         duplicate: true,
         messageId:
           emailId,
+        inboxId:
+          inbox.id,
         inbox:
           inbox.address
       };
@@ -637,6 +794,8 @@ async function storeResendReceivedEmail(
         stored: true,
         duplicate: true,
         messageId,
+        inboxId:
+          inbox.id,
         inbox:
           inbox.address
       };
@@ -645,17 +804,27 @@ async function storeResendReceivedEmail(
     throw messageError;
   }
 
+  const attachmentCount =
+    await storeResendAttachments(
+      emailId,
+      messageId
+    );
+
   return {
     stored: true,
     duplicate: false,
     messageId,
+    inboxId:
+      inbox.id,
     inbox:
       inbox.address,
     from:
       sender,
     to:
       recipient,
-    subject
+    subject,
+    attachments:
+      attachmentCount
   };
 }
 
@@ -848,19 +1017,22 @@ app.post(
           ? req.body.toString("utf8")
           : String(req.body || "");
 
-      const svixId =
+      const webhookId =
+        req.get("webhook-id") ||
         req.get("svix-id");
 
-      const svixTimestamp =
+      const webhookTimestamp =
+        req.get("webhook-timestamp") ||
         req.get("svix-timestamp");
 
-      const svixSignature =
+      const webhookSignature =
+        req.get("webhook-signature") ||
         req.get("svix-signature");
 
       if (
-        !svixId ||
-        !svixTimestamp ||
-        !svixSignature
+        !webhookId ||
+        !webhookTimestamp ||
+        !webhookSignature
       ) {
         console.error(
           "[RESEND] Missing webhook signature headers."
@@ -882,11 +1054,11 @@ app.post(
             payload: rawBody,
 
             headers: {
-              id: svixId,
+              id: webhookId,
               timestamp:
-                svixTimestamp,
+                webhookTimestamp,
               signature:
-                svixSignature
+                webhookSignature
             },
 
             webhookSecret:
@@ -936,6 +1108,71 @@ app.post(
               "email_id missing"
           });
       }
+
+      const result =
+        await storeResendReceivedEmail(
+          emailId,
+          event.data || {}
+        );
+
+      if (!result.stored) {
+        console.warn(
+          "[RESEND] Email received but not stored:",
+          result
+        );
+
+        return res.json({
+          received: true,
+          stored: false,
+          reason:
+            result.reason,
+          recipients:
+            result.recipients
+        });
+      }
+
+      if (result.duplicate) {
+        console.log(
+          `[RESEND] Duplicate webhook ignored: ${emailId}`
+        );
+
+        return res.json({
+          received: true,
+          stored: true,
+          duplicate: true,
+          messageId:
+            result.messageId,
+          inboxId:
+            result.inboxId
+        });
+      }
+
+      console.log(
+        `[RESEND] Email received: ${result.from} -> ${result.to}`
+      );
+
+      console.log(
+        `[RESEND] Subject: ${result.subject}`
+      );
+
+      console.log(
+        `[RESEND] Message ID: ${result.messageId}`
+      );
+
+      console.log(
+        `[RESEND] Attachments: ${result.attachments || 0}`
+      );
+
+      return res.json({
+        received: true,
+        stored: true,
+        messageId:
+          result.messageId,
+        inboxId:
+          result.inboxId,
+        attachments:
+          result.attachments || 0
+      });
 
       /*
       =================================================
