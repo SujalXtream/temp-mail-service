@@ -22,6 +22,11 @@ function envValue(name, fallback = "") {
 
 const HTTP_PORT = Number(envValue("PORT", "4000"));
 const SMTP_PORT = Number(envValue("SMTP_PORT", "2525"));
+const IS_VERCEL =
+  envValue("VERCEL") === "1" ||
+  Boolean(envValue("VERCEL_ENV"));
+const SHOULD_START_LOCAL_SERVERS =
+  !IS_VERCEL;
 
 /*
 =====================================================
@@ -53,14 +58,20 @@ if (!SUPABASE_URL) {
   console.error(
     "Missing SUPABASE_URL environment variable."
   );
-  process.exit(1);
+
+  if (SHOULD_START_LOCAL_SERVERS) {
+    process.exit(1);
+  }
 }
 
 if (!SUPABASE_SECRET_KEY) {
   console.error(
     "Missing SUPABASE_SECRET_KEY environment variable."
   );
-  process.exit(1);
+
+  if (SHOULD_START_LOCAL_SERVERS) {
+    process.exit(1);
+  }
 }
 
 /*
@@ -69,17 +80,20 @@ SUPABASE
 =====================================================
 */
 
-const supabase = createClient(
-  SUPABASE_URL,
-  SUPABASE_SECRET_KEY,
-  {
-    auth: {
-      autoRefreshToken: false,
-      persistSession: false,
-      detectSessionInUrl: false
-    }
-  }
-);
+const supabase =
+  SUPABASE_URL && SUPABASE_SECRET_KEY
+    ? createClient(
+        SUPABASE_URL,
+        SUPABASE_SECRET_KEY,
+        {
+          auth: {
+            autoRefreshToken: false,
+            persistSession: false,
+            detectSessionInUrl: false
+          }
+        }
+      )
+    : null;
 
 /*
 =====================================================
@@ -900,6 +914,22 @@ app.get(
   "/api/health",
   async (_req, res) => {
     try {
+      if (!supabase) {
+        return res
+          .status(503)
+          .json({
+            ok: false,
+            service:
+              "temp-mail-api",
+            database:
+              "not_configured",
+            error:
+              "Database is not configured",
+            timestamp:
+              new Date().toISOString()
+          });
+      }
+
       const { error } =
         await supabase
           .from("inboxes")
@@ -1009,6 +1039,19 @@ app.post(
           .json({
             error:
               "Resend webhook secret is not configured"
+          });
+      }
+
+      if (!supabase) {
+        console.error(
+          "[RESEND] Supabase is not configured."
+        );
+
+        return res
+          .status(503)
+          .json({
+            error:
+              "Database is not configured"
           });
       }
 
@@ -1721,6 +1764,21 @@ app.use(
   express.json({
     limit: "1mb"
   })
+);
+
+app.use(
+  (req, res, next) => {
+    if (!supabase) {
+      return res
+        .status(503)
+        .json({
+          error:
+            "Database is not configured"
+        });
+    }
+
+    return next();
+  }
 );
 
 /*
@@ -2951,19 +3009,21 @@ EXPIRATION CLEANUP
 =====================================================
 */
 
-setInterval(
-  () => {
-    cleanupExpired().catch(
-      (error) => {
-        console.error(
-          "Scheduled cleanup error:",
-          error
-        );
-      }
-    );
-  },
-  30 * 1000
-);
+if (SHOULD_START_LOCAL_SERVERS) {
+  setInterval(
+    () => {
+      cleanupExpired().catch(
+        (error) => {
+          console.error(
+            "Scheduled cleanup error:",
+            error
+          );
+        }
+      );
+    },
+    30 * 1000
+  );
+}
 
 /*
 =====================================================
@@ -3041,19 +3101,21 @@ async function syncRecentResendEmails() {
   }
 }
 
-setInterval(
-  () => {
-    syncRecentResendEmails().catch(
-      (error) => {
-        console.error(
-          "[RESEND] Scheduled polling error:",
-          safeErrorMessage(error)
-        );
-      }
-    );
-  },
-  60 * 1000
-);
+if (SHOULD_START_LOCAL_SERVERS) {
+  setInterval(
+    () => {
+      syncRecentResendEmails().catch(
+        (error) => {
+          console.error(
+            "[RESEND] Scheduled polling error:",
+            safeErrorMessage(error)
+          );
+        }
+      );
+    },
+    60 * 1000
+  );
+}
 
 /*
 =====================================================
@@ -3061,92 +3123,94 @@ START HTTP SERVER
 =====================================================
 */
 
-app.listen(
-  HTTP_PORT,
-  async () => {
-    console.log("");
+if (SHOULD_START_LOCAL_SERVERS) {
+  app.listen(
+    HTTP_PORT,
+    async () => {
+      console.log("");
 
-    console.log(
-      "========================================"
-    );
+      console.log(
+        "========================================"
+      );
 
-    console.log(
-      "           TEMP MAIL API"
-    );
+      console.log(
+        "           TEMP MAIL API"
+      );
 
-    console.log(
-      "========================================"
-    );
+      console.log(
+        "========================================"
+      );
 
-    console.log("");
+      console.log("");
 
-    console.log(
-      `HTTP Port: ${HTTP_PORT}`
-    );
+      console.log(
+        `HTTP Port: ${HTTP_PORT}`
+      );
 
-    console.log(
-      `Health: http://localhost:${HTTP_PORT}/api/health`
-    );
+      console.log(
+        `Health: http://localhost:${HTTP_PORT}/api/health`
+      );
 
-    console.log(
-      `Domain: ${MAIL_DOMAIN}`
-    );
+      console.log(
+        `Domain: ${MAIL_DOMAIN}`
+      );
 
-    console.log(
-      "Database: Supabase PostgreSQL"
-    );
+      console.log(
+        "Database: Supabase PostgreSQL"
+      );
 
-    console.log(
-      `Resend API: ${
-        resend
-          ? "configured"
-          : "not configured"
-      }`
-    );
+      console.log(
+        `Resend API: ${
+          resend
+            ? "configured"
+            : "not configured"
+        }`
+      );
 
-    console.log(
-      `Resend webhook: ${
-        RESEND_WEBHOOK_SECRET
-          ? "configured"
-          : "not configured"
-      }`
-    );
+      console.log(
+        `Resend webhook: ${
+          RESEND_WEBHOOK_SECRET
+            ? "configured"
+            : "not configured"
+        }`
+      );
 
-    console.log(
-      "========================================"
-    );
+      console.log(
+        "========================================"
+      );
 
-    console.log("");
+      console.log("");
 
-    try {
-      const {
-        error
-      } =
-        await supabase
-          .from("inboxes")
-          .select("id")
-          .limit(1);
+      try {
+        const {
+          error
+        } =
+          await supabase
+            .from("inboxes")
+            .select("id")
+            .limit(1);
 
-      if (error) {
+        if (error) {
+          console.error(
+            "[DATABASE] Connection failed:",
+            error
+          );
+        } else {
+          console.log(
+            "[DATABASE] Supabase connection successful."
+          );
+        }
+      } catch (error) {
         console.error(
-          "[DATABASE] Connection failed:",
+          "[DATABASE] Connection error:",
           error
         );
-      } else {
-        console.log(
-          "[DATABASE] Supabase connection successful."
-        );
       }
-    } catch (error) {
-      console.error(
-        "[DATABASE] Connection error:",
-        error
-      );
-    }
 
-    console.log("");
-  }
-);
+      console.log("");
+    }
+  );
+}
 
 /*
 =====================================================
@@ -3154,26 +3218,30 @@ START SMTP SERVER
 =====================================================
 */
 
-smtpServer.listen(
-  SMTP_PORT,
-  "0.0.0.0",
-  () => {
-    console.log(
-      `[SMTP] Listening on port ${SMTP_PORT}`
-    );
+if (SHOULD_START_LOCAL_SERVERS) {
+  smtpServer.listen(
+    SMTP_PORT,
+    "0.0.0.0",
+    () => {
+      console.log(
+        `[SMTP] Listening on port ${SMTP_PORT}`
+      );
 
-    console.log(
-      `[SMTP] Accepted domains: ${[
-        ...acceptedSmtpDomains
-      ].join(", ")}`
-    );
+      console.log(
+        `[SMTP] Accepted domains: ${[
+          ...acceptedSmtpDomains
+        ].join(", ")}`
+      );
 
-    console.log("");
+      console.log("");
 
-    console.log(
-      "Phase 2 mail receiver is ready."
-    );
+      console.log(
+        "Phase 2 mail receiver is ready."
+      );
 
-    console.log("");
-  }
-);
+      console.log("");
+    }
+  );
+}
+
+export default app;
